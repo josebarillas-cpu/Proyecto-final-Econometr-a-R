@@ -1,0 +1,149 @@
+
+
+```{r}
+
+# Competencia SalePrice 
+
+
+library(tidyverse)
+library(caret)
+library(randomForest)
+library(glmnet)
+library(xgboost)
+library(forcats)
+
+# 1. Cargar datasets
+train <- read.csv("data_train_v3.csv")
+test  <- read.csv("test_v3.csv")
+
+# 2. Preprocesamiento
+categorical_vars <- sapply(train, is.character)
+train[categorical_vars] <- lapply(train[categorical_vars], factor)
+test[categorical_vars]  <- lapply(test[categorical_vars], factor)
+
+# Imputar valores faltantes
+for (col in names(train)) {
+  if (is.numeric(train[[col]])) {
+    train[[col]][is.na(train[[col]])] <- median(train[[col]], na.rm = TRUE)
+  }
+}
+for (col in names(test)) {
+  if (is.numeric(test[[col]])) {
+    test[[col]][is.na(test[[col]])] <- median(test[[col]], na.rm = TRUE)
+  }
+}
+
+train <- train %>% mutate_if(is.factor, ~fct_explicit_na(., "None"))
+test  <- test %>% mutate_if(is.factor, ~fct_explicit_na(., "None"))
+
+# 3. Unificar niveles de factores entre train y test
+for (col in names(train)) {
+  if (is.factor(train[[col]]) && col %in% names(test)) {
+    niveles <- union(levels(train[[col]]), levels(test[[col]]))
+    train[[col]] <- factor(train[[col]], levels = niveles)
+    test[[col]]  <- factor(test[[col]], levels = niveles)
+  }
+}
+
+# 4. Eliminar columnas inútiles
+nzv <- nearZeroVar(train, saveMetrics = TRUE)
+train <- train[, !nzv$zeroVar]
+test  <- test[, names(test) %in% names(train)]
+
+# 5. Configuración de validación cruzada
+set.seed(123)
+ctrl <- trainControl(method = "cv", number = 5)
+
+# 6. Modelos con caret
+lm_fit <- train(SalePrice ~ ., data=train, method="lm", trControl=ctrl,
+                preProcess=c("center","scale"))
+
+glmnet_fit <- train(SalePrice ~ ., data=train, method="glmnet", trControl=ctrl,
+                    tuneLength=3, preProcess=c("center","scale"))
+
+rf_fit <- train(SalePrice ~ ., data=train, method="rf", trControl=ctrl,
+                tuneLength=2)
+
+results <- resamples(list(LM=lm_fit, RidgeLasso=glmnet_fit, RF=rf_fit))
+print(summary(results))
+
+# 7. XGBoost manual con columnas alineadas
+common_cols <- intersect(names(train), names(test))
+train_aligned <- train[, c(common_cols, "SalePrice")]
+test_aligned  <- test[, common_cols]
+
+# Forzar que test tenga todas las columnas de train
+missing_cols <- setdiff(names(train_aligned), names(test_aligned))
+for (col in missing_cols) {
+  test_aligned[[col]] <- NA
+}
+
+# Crear variables dummy
+dummies <- dummyVars(SalePrice ~ ., data=train_aligned)
+train_xgb <- data.frame(predict(dummies, newdata=train_aligned))
+train_xgb$SalePrice <- train_aligned$SalePrice
+test_xgb <- data.frame(predict(dummies, newdata=test_aligned))
+
+# Entrenar XGBoost
+dtrain <- xgb.DMatrix(data=as.matrix(train_xgb %>% select(-SalePrice)),
+                      label=train_xgb$SalePrice)
+dtest  <- xgb.DMatrix(data=as.matrix(test_xgb))
+
+params <- list(objective="reg:squarederror", max_depth=4, eta=0.1)
+xgb_model <- xgb.train(params=params, data=dtrain, nrounds=100)
+pred_xgb <- predict(xgb_model, dtest)
+
+# 8. Submission final
+best_model <- rf_fit   # cámbialo según el menor RMSE
+best_pred  <- predict(best_model, newdata=test)
+
+submission <- data.frame(Id=test$Id, SalePrice=best_pred)
+write.csv(submission, "submission_final.csv", row.names=FALSE)
+
+submission_xgb <- data.frame(Id=test$Id, SalePrice=pred_xgb)
+write.csv(submission_xgb, "submission_xgb.csv", row.names=FALSE)
+
+
+# Final
+```
+
+
+```{r}
+
+# Stacking manual
+
+# Predicciones en train
+pred_rf_train     <- predict(rf_fit, newdata=train)
+pred_glmnet_train <- predict(glmnet_fit, newdata=train)
+pred_xgb_train    <- predict(xgb_model, newdata=dtrain)
+
+stack_train <- data.frame(
+  SalePrice = train$SalePrice,
+  RF = pred_rf_train,
+  GLMNET = pred_glmnet_train,
+  XGB = pred_xgb_train
+)
+
+# Meta-modelo lineal
+meta_fit <- train(SalePrice ~ ., data=stack_train, method="lm", trControl=ctrl)
+
+# Predicciones en test
+pred_rf_test     <- predict(rf_fit, newdata=test)
+pred_glmnet_test <- predict(glmnet_fit, newdata=test)
+pred_xgb_test    <- predict(xgb_model, newdata=dtest)
+
+stack_test <- data.frame(
+  RF = pred_rf_test,
+  GLMNET = pred_glmnet_test,
+  XGB = pred_xgb_test
+)
+
+pred_stack <- predict(meta_fit, newdata=stack_test)
+
+# Submission del ensemble
+submission_stack <- data.frame(Id=test$Id, SalePrice=pred_stack)
+write.csv(submission_stack, "submission_stack.csv", row.names=FALSE)
+```
+
+
+```{r}
